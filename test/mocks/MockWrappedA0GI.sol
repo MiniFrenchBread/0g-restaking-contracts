@@ -40,9 +40,18 @@ contract MockWrappedA0GI is ERC20 {
     /// @notice Burns W0G from `from`, gated by the precompile's per-minter supply.
     /// @dev No allowance check — the privileged caller (Bridge) is expected to have validated
     ///      intent. Real W0G's `burnFrom` similarly skips allowance because the precompile is
-    ///      the gatekeeper.
+    ///      the gatekeeper. Bridge.burnAndSend uses transferFrom + burn(uint256) instead, but
+    ///      we keep burnFrom available for tests that exercise the legacy path.
     function burnFrom(address from, uint256 amount) external {
         MockA0GIBasePrecompile(PRECOMPILE).burn(msg.sender, amount);
         _burn(from, amount);
+    }
+
+    /// @notice Self-burn (matches W0G's `burn(uint256)` selector 0x42966c68 and BridgeERC20's
+    ///         `burn(uint256)` self-burn). Bridge.burnAndSend uses this after transferFrom.
+    /// @dev Burns msg.sender's balance and decrements precompile MinterSupply[msg.sender].
+    function burn(uint256 amount) external {
+        MockA0GIBasePrecompile(PRECOMPILE).burn(msg.sender, amount);
+        _burn(msg.sender, amount);
     }
 }

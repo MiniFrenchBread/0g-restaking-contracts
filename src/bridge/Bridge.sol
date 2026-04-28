@@ -10,11 +10,21 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IBridge} from "./IBridge.sol";
 import {BridgeERC20} from "./BridgeERC20.sol";
 
-/// @dev Minimal interface for any token that supports MINTER_ROLE-style mint/burnFrom.
-///      Both BridgeERC20 (templated minted-token) and W0G match this shape.
-interface IMintBurnable {
+/// @dev Minimal interface for any token that supports MINTER_ROLE-style
+/// `mint(to,amount)` and self-burn `burn(amount)`. Both BridgeERC20
+/// (templated minted-token) and W0G's `burn(uint256)` (selector 0x42966c68)
+/// match this shape.
+///
+/// burnAndSend deliberately does NOT call burnFrom on the user's behalf.
+/// Instead it does a two-step: (1) IERC20.transferFrom user→Bridge,
+/// (2) IBurnable.burn from Bridge's own balance. This:
+///   - works against any ERC-20 standard burnable (no `burnFrom` requirement),
+///   - keeps the precompile minter == msg.sender == Bridge invariant explicit,
+///   - matches the user's semantic expectation that the user "transfers tokens
+///     to the bridge", not "lets the bridge burn from the user directly".
+interface IBurnable {
     function mint(address to, uint256 amount) external;
-    function burnFrom(address from, uint256 amount) external;
+    function burn(uint256 amount) external;
 }
 
 /**
@@ -104,13 +114,20 @@ contract Bridge is IBridge, Initializable, AccessControlUpgradeable {
     }
 
     /// @inheritdoc IBridge
+    /// @dev Two-step: (1) transferFrom user → Bridge, (2) Bridge self-burns.
+    ///      Token must implement standard IERC20 + a `burn(uint256)` method
+    ///      that, internally, decrements the precompile's MinterSupply[Bridge]
+    ///      (W0G does this via `_burnFrom` calling `precompile.burn(msg.sender, ..)`,
+    ///      where msg.sender == Bridge). BridgeERC20 template matches the
+    ///      same interface.
     function burnAndSend(address token, uint64 dstCID, address recipient, uint256 amount) external {
         BridgeStorage storage $ = _getBridgeStorage();
         TokenConfig memory cfg = $.tokens[token];
         if (!cfg.enabled) revert TokenDisabled();
         if (cfg.mode != BridgeMode.MintBurn) revert WrongMode();
 
-        IMintBurnable(token).burnFrom(msg.sender, amount);
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        IBurnable(token).burn(amount);
         uint64 nonce = ++$.outboundNonce[dstCID];
         emit BridgeOut(
             $.localChainID, dstCID, nonce, token, $.remoteToken[token][dstCID], recipient, amount, uint8(cfg.mode)
@@ -183,7 +200,7 @@ contract Bridge is IBridge, Initializable, AccessControlUpgradeable {
             }
         }
         if (cfg.mode == BridgeMode.MintBurn) {
-            IMintBurnable(m.localToken).mint(m.recipient, m.amount);
+            IBurnable(m.localToken).mint(m.recipient, m.amount);
         } else {
             IERC20(m.localToken).safeTransfer(m.recipient, m.amount);
         }

@@ -121,11 +121,16 @@ contract W0gIntegrationTest is BridgeBaseTest {
         (, uint256 supplyAfterMint,) = precompile.minterSupply(address(bridge));
         assertEq(supplyAfterMint, 30 ether);
 
+        // burnAndSend uses transferFrom + burn(uint256); alice approves the bridge.
+        vm.prank(alice);
+        w0g.approve(address(bridge), type(uint256).max);
+
         // alice burns via the bridge.
         vm.prank(alice);
         bridge.burnAndSend(address(w0g), DST_CID, bob, 10 ether);
 
         assertEq(w0g.balanceOf(alice), 20 ether);
+        assertEq(w0g.balanceOf(address(bridge)), 0); // burned, not held
         (, uint256 supplyAfterBurn,) = precompile.minterSupply(address(bridge));
         assertEq(supplyAfterBurn, 20 ether);
         assertEq(bridge.outboundNonce(DST_CID), 1);

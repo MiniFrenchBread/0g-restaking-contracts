@@ -38,12 +38,18 @@ contract BridgeUserPathsTest is BridgeBaseTest {
         token.mint(alice, 100 ether);
         assertEq(token.balanceOf(alice), 100 ether);
 
+        // burnAndSend uses transferFrom + burn; alice must approve the bridge first.
+        vm.prank(alice);
+        token.approve(address(bridge), type(uint256).max);
+
         vm.expectEmit(true, true, false, true, address(bridge));
         emit IBridge.BridgeOut(LOCAL_CID, DST_CID, 1, address(token), remote, bob, 30 ether, 1);
         vm.prank(alice);
         bridge.burnAndSend(address(token), DST_CID, bob, 30 ether);
 
         assertEq(token.balanceOf(alice), 70 ether);
+        assertEq(token.balanceOf(address(bridge)), 0); // burned, not held
+        assertEq(token.totalSupply(), 70 ether);
         assertEq(bridge.outboundNonce(DST_CID), 1);
     }
 

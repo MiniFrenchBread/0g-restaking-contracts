@@ -12,8 +12,8 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
  *      `beacon.upgradeTo(newImpl)` upgrades every minted-token contract simultaneously.
  *      The Bridge contract is granted `MINTER_ROLE` (and `DEFAULT_ADMIN_ROLE`) on init,
  *      enabling it to mint/burn on behalf of cross-chain messages. The interface — `mint(to, amt)`
- *      and `burnFrom(from, amt)` — matches the W0G ERC-20 surface exactly so the Bridge can call
- *      either without a token-specific adapter.
+ *      + `burn(amt)` self-burn — matches W0G's `burn(uint256)` (selector 0x42966c68) exactly so
+ *      Bridge.burnAndSend's two-step `transferFrom + burn` works against either token.
  */
 contract BridgeERC20 is Initializable, ERC20Upgradeable, AccessControlUpgradeable {
     /// @dev Role required to mint or burn. Granted to the Bridge proxy on init.
@@ -35,9 +35,11 @@ contract BridgeERC20 is Initializable, ERC20Upgradeable, AccessControlUpgradeabl
         _mint(to, amount);
     }
 
-    /// @notice Burns `amount` from `from`. Restricted to the Bridge — the bridge is the gatekeeper
-    ///         that already checked the user's intent in `burnAndSend`, so no allowance is required.
-    function burnFrom(address from, uint256 amount) external onlyRole(MINTER_ROLE) {
-        _burn(from, amount);
+    /// @notice Self-burn: caller (must hold MINTER_ROLE — i.e. the Bridge) burns its own ledger
+    ///         entry. Bridge.burnAndSend transfers user tokens → Bridge first via transferFrom,
+    ///         then calls burn(amount) to drain Bridge's own balance. No allowance needed because
+    ///         the bridge owns the tokens when it burns.
+    function burn(uint256 amount) external onlyRole(MINTER_ROLE) {
+        _burn(msg.sender, amount);
     }
 }
