@@ -50,7 +50,9 @@ contract MockWrappedA0GI is ERC20 {
     /// @notice Self-burn (matches W0G's `burn(uint256)` selector 0x42966c68 and BridgeERC20's
     ///         `burn(uint256)` self-burn). Bridge.burnAndSend uses this after transferFrom.
     /// @dev Burns msg.sender's balance and decrements precompile MinterSupply[msg.sender].
-    function burn(uint256 amount) external {
+    function burn(
+        uint256 amount
+    ) external {
         MockA0GIBasePrecompile(PRECOMPILE).burn(msg.sender, amount);
         _burn(msg.sender, amount);
     }

@@ -39,7 +39,9 @@ contract BridgeERC20 is Initializable, ERC20Upgradeable, AccessControlUpgradeabl
     ///         entry. Bridge.burnAndSend transfers user tokens → Bridge first via transferFrom,
     ///         then calls burn(amount) to drain Bridge's own balance. No allowance needed because
     ///         the bridge owns the tokens when it burns.
-    function burn(uint256 amount) external onlyRole(MINTER_ROLE) {
+    function burn(
+        uint256 amount
+    ) external onlyRole(MINTER_ROLE) {
         _burn(msg.sender, amount);
     }
 }

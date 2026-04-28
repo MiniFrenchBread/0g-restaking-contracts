@@ -24,7 +24,9 @@ import {BridgeERC20} from "./BridgeERC20.sol";
 ///     to the bridge", not "lets the bridge burn from the user directly".
 interface IBurnable {
     function mint(address to, uint256 amount) external;
-    function burn(uint256 amount) external;
+    function burn(
+        uint256 amount
+    ) external;
 }
 
 /**
