@@ -53,6 +53,19 @@ interface IBridge {
     /// @dev Configuration setter received the zero address.
     error ZeroAddress();
 
+    /// @dev User-path call's `amount` is below the configured `minCrossOutAmount` for the token.
+    error AmountTooSmall();
+
+    /// @dev `setSpamControl` called with `feeBps` exceeding `MAX_FEE_BPS` (20%).
+    error FeeBpsTooHigh();
+
+    /// @dev Computed (and clamped) fee is greater than or equal to the user's `amount`, leaving
+    ///      nothing to bridge after the fee deduction.
+    error FeeExceedsAmount();
+
+    /// @dev `setSpamControl` called with `feeMin > feeMax`.
+    error InvalidFeeBounds();
+
     // ============= Events =============
 
     /// @notice Emitted on the source chain when a user initiates a bridge transfer.
@@ -84,6 +97,22 @@ interface IBridge {
 
     /// @notice Emitted on the destination chain after `retry` is attempted.
     event BridgeMessageRetried(uint64 indexed srcChainID, uint64 nonce, bool success);
+
+    /// @notice Emitted when an admin updates a token's anti-spam controls.
+    /// @param token Token whose controls were updated.
+    /// @param minCrossOutAmount New minimum cross-out amount.
+    /// @param feeBps New basis-points fee.
+    /// @param feeMin New floor on the deducted fee.
+    /// @param feeMax New cap on the deducted fee.
+    /// @param feeRecipient New fee receiver (zero leaves fees in the bridge / burns them).
+    event SpamControlUpdated(
+        address indexed token,
+        uint256 minCrossOutAmount,
+        uint16 feeBps,
+        uint256 feeMin,
+        uint256 feeMax,
+        address feeRecipient
+    );
 
     // ============= User paths =============
 
@@ -135,6 +164,26 @@ interface IBridge {
         uint64 chainID
     ) external;
 
+    /// @notice Configure per-token anti-spam controls (minimum amount + per-tx fee).
+    /// @dev Only callable by `ADMIN_ROLE` (BridgeAgency). All values are stored verbatim and applied
+    ///      to subsequent `lockAndSend` / `burnAndSend` calls. Setting all fields to zero disables
+    ///      the controls for the token.
+    /// @param token Token to configure (any registered local token, regardless of mode).
+    /// @param minCrossOutAmount Reject `lockAndSend` / `burnAndSend` whose `amount` is strictly less.
+    /// @param feeBps Basis-points fee on `amount`. Capped at `MAX_FEE_BPS` (2000 = 20%).
+    /// @param feeMin Floor on the computed fee (acts as a flat minimum). Must be `<= feeMax`.
+    /// @param feeMax Cap on the computed fee. Must be `>= feeMin`.
+    /// @param feeRecipient Where collected fees go. If `address(0)`, fees stay in the bridge for
+    ///        LockRelease tokens, or are burned alongside the cross-out amount for MintBurn tokens.
+    function setSpamControl(
+        address token,
+        uint256 minCrossOutAmount,
+        uint16 feeBps,
+        uint256 feeMin,
+        uint256 feeMax,
+        address feeRecipient
+    ) external;
+
     // ============= Views =============
 
     function localChainID() external view returns (uint64);
@@ -147,4 +196,17 @@ interface IBridge {
     ) external view returns (uint64);
     function inboundConsumed(uint64 srcCID, uint64 nonce) external view returns (bool);
     function pendingMessage(uint64 srcCID, uint64 nonce) external view returns (InboundMessage memory);
+
+    /// @notice Read the configured anti-spam controls for `token`.
+    /// @return minCrossOutAmount Minimum acceptable amount.
+    /// @return feeBps Basis-points fee.
+    /// @return feeMin Lower clamp on the computed fee.
+    /// @return feeMax Upper clamp on the computed fee.
+    /// @return feeRecipient Fee destination (zero = stay-in-bridge / burn).
+    function spamControl(
+        address token
+    )
+        external
+        view
+        returns (uint256 minCrossOutAmount, uint16 feeBps, uint256 feeMin, uint256 feeMax, address feeRecipient);
 }

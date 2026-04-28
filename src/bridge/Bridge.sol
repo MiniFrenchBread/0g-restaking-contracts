@@ -49,10 +49,29 @@ contract Bridge is IBridge, Initializable, AccessControlUpgradeable {
     ///      deploying new BridgeERC20 instances.
     bytes32 public constant ADMIN_ROLE = keccak256("BRIDGE_ADMIN_ROLE");
 
+    /// @notice Hard cap on `feeBps` accepted by `setSpamControl`. 2000 = 20%.
+    /// @dev Documented in plan §1.5.4 — protects users against a misconfigured agency.
+    uint16 public constant MAX_FEE_BPS = 2000;
+
     /// @notice Per-token bridge configuration. Schema-frozen (only enabled flag + mode).
     struct TokenConfig {
         bool enabled;
         BridgeMode mode;
+    }
+
+    /// @notice Per-token anti-spam controls (plan §1.5).
+    /// @dev `feeBps` is basis-points (10_000 = 100%) and capped by `MAX_FEE_BPS`.
+    ///      Fee is computed as `(amount * feeBps) / 10_000`, then clamped to `[feeMin, feeMax]`.
+    ///      If `feeRecipient == address(0)`:
+    ///        - LockRelease: fee tokens stay on the bridge alongside the escrowed liquidity.
+    ///        - MintBurn:   fee is burned together with `amountAfterFee` (i.e., `burn(amount)`).
+    ///      Otherwise the fee is forwarded to `feeRecipient` before the bridge-side action.
+    struct TokenSpamControl {
+        uint256 minCrossOutAmount;
+        uint16 feeBps;
+        uint256 feeMin;
+        uint256 feeMax;
+        address feeRecipient;
     }
 
     /// @custom:storage-location erc7201:0g.bridge.Bridge
@@ -66,6 +85,7 @@ contract Bridge is IBridge, Initializable, AccessControlUpgradeable {
         mapping(uint64 => mapping(uint64 => bool)) inboundConsumed;
         mapping(uint64 => mapping(uint64 => InboundMessage)) pendingMessages;
         mapping(uint64 => mapping(uint64 => bool)) hasPending;
+        mapping(address => TokenSpamControl) spamControl;
     }
 
     // keccak256(abi.encode(uint256(keccak256("0g.bridge.Bridge")) - 1)) & ~bytes32(uint256(0xff))
@@ -100,38 +120,91 @@ contract Bridge is IBridge, Initializable, AccessControlUpgradeable {
     // ============= User paths =============
 
     /// @inheritdoc IBridge
+    /// @dev Anti-spam (plan §1.5): user pays the full `amount` upfront. The fee portion is
+    ///      forwarded to the configured `feeRecipient` (or stays in the bridge if unset). Only
+    ///      `amountAfterFee` is recorded in the cross-chain `BridgeOut` event.
     function lockAndSend(address token, uint64 dstCID, address recipient, uint256 amount) external {
         BridgeStorage storage $ = _getBridgeStorage();
         TokenConfig memory cfg = $.tokens[token];
         if (!cfg.enabled) revert TokenDisabled();
         if (cfg.mode != BridgeMode.LockRelease) revert WrongMode();
 
+        (uint256 amountAfterFee, uint256 fee, address feeRecipient) = _applyAntiSpam($, token, amount);
+
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        if (fee > 0 && feeRecipient != address(0)) {
+            IERC20(token).safeTransfer(feeRecipient, fee);
+        }
         uint64 nonce = ++$.outboundNonce[dstCID];
         emit BridgeOut(
-            $.localChainID, dstCID, nonce, token, $.remoteToken[token][dstCID], recipient, amount, uint8(cfg.mode)
+            $.localChainID,
+            dstCID,
+            nonce,
+            token,
+            $.remoteToken[token][dstCID],
+            recipient,
+            amountAfterFee,
+            uint8(cfg.mode)
         );
     }
 
     /// @inheritdoc IBridge
-    /// @dev Two-step: (1) transferFrom user → Bridge, (2) Bridge self-burns.
-    ///      Token must implement standard IERC20 + a `burn(uint256)` method
-    ///      that, internally, decrements the precompile's MinterSupply[Bridge]
-    ///      (W0G does this via `_burnFrom` calling `precompile.burn(msg.sender, ..)`,
-    ///      where msg.sender == Bridge). BridgeERC20 template matches the
-    ///      same interface.
+    /// @dev Two-step: (1) transferFrom user → Bridge, (2) Bridge self-burns. Token must implement
+    ///      standard IERC20 + a `burn(uint256)` method that, internally, decrements the precompile's
+    ///      MinterSupply[Bridge] (W0G does this via `_burnFrom` calling
+    ///      `precompile.burn(msg.sender, ..)`, where msg.sender == Bridge). BridgeERC20 template
+    ///      matches the same interface.
+    ///
+    ///      Anti-spam (plan §1.5): user pays the full `amount`. If `feeRecipient` is set, that
+    ///      portion is forwarded out and only `amountAfterFee` is burned. Otherwise the full
+    ///      `amount` is burned — fees behave like additional protocol revenue retired from supply.
     function burnAndSend(address token, uint64 dstCID, address recipient, uint256 amount) external {
         BridgeStorage storage $ = _getBridgeStorage();
         TokenConfig memory cfg = $.tokens[token];
         if (!cfg.enabled) revert TokenDisabled();
         if (cfg.mode != BridgeMode.MintBurn) revert WrongMode();
 
+        (uint256 amountAfterFee, uint256 fee, address feeRecipient) = _applyAntiSpam($, token, amount);
+
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        IBurnable(token).burn(amount);
+        if (fee > 0 && feeRecipient != address(0)) {
+            IERC20(token).safeTransfer(feeRecipient, fee);
+            IBurnable(token).burn(amountAfterFee);
+        } else {
+            IBurnable(token).burn(amount);
+        }
         uint64 nonce = ++$.outboundNonce[dstCID];
         emit BridgeOut(
-            $.localChainID, dstCID, nonce, token, $.remoteToken[token][dstCID], recipient, amount, uint8(cfg.mode)
+            $.localChainID,
+            dstCID,
+            nonce,
+            token,
+            $.remoteToken[token][dstCID],
+            recipient,
+            amountAfterFee,
+            uint8(cfg.mode)
         );
+    }
+
+    /// @dev Apply per-token anti-spam controls. Reverts on under-min input or when the (clamped)
+    ///      fee would consume the entire amount. Returns the remaining cross-out amount, the fee
+    ///      to extract, and where to send it.
+    function _applyAntiSpam(
+        BridgeStorage storage $,
+        address token,
+        uint256 amount
+    ) internal view returns (uint256 amountAfterFee, uint256 fee, address feeRecipient) {
+        TokenSpamControl memory s = $.spamControl[token];
+        if (amount < s.minCrossOutAmount) revert AmountTooSmall();
+
+        if (s.feeBps > 0 || s.feeMin > 0) {
+            fee = (amount * s.feeBps) / 10_000;
+            if (fee < s.feeMin) fee = s.feeMin;
+            if (fee > s.feeMax) fee = s.feeMax;
+        }
+        if (fee >= amount) revert FeeExceedsAmount();
+        amountAfterFee = amount - fee;
+        feeRecipient = s.feeRecipient;
     }
 
     // ============= System path =============
@@ -269,6 +342,30 @@ contract Bridge is IBridge, Initializable, AccessControlUpgradeable {
         $.localChainID = chainID;
     }
 
+    /// @inheritdoc IBridge
+    function setSpamControl(
+        address token,
+        uint256 minCrossOutAmount,
+        uint16 feeBps,
+        uint256 feeMin,
+        uint256 feeMax,
+        address feeRecipient
+    ) external onlyRole(ADMIN_ROLE) {
+        if (token == address(0)) revert ZeroAddress();
+        if (feeBps > MAX_FEE_BPS) revert FeeBpsTooHigh();
+        if (feeMin > feeMax) revert InvalidFeeBounds();
+
+        BridgeStorage storage $ = _getBridgeStorage();
+        $.spamControl[token] = TokenSpamControl({
+            minCrossOutAmount: minCrossOutAmount,
+            feeBps: feeBps,
+            feeMin: feeMin,
+            feeMax: feeMax,
+            feeRecipient: feeRecipient
+        });
+        emit SpamControlUpdated(token, minCrossOutAmount, feeBps, feeMin, feeMax, feeRecipient);
+    }
+
     // ============= Views =============
 
     /// @inheritdoc IBridge
@@ -304,6 +401,18 @@ contract Bridge is IBridge, Initializable, AccessControlUpgradeable {
     /// @inheritdoc IBridge
     function pendingMessage(uint64 srcCID, uint64 nonce) external view returns (InboundMessage memory) {
         return _getBridgeStorage().pendingMessages[srcCID][nonce];
+    }
+
+    /// @inheritdoc IBridge
+    function spamControl(
+        address token
+    )
+        external
+        view
+        returns (uint256 minCrossOutAmount, uint16 feeBps, uint256 feeMin, uint256 feeMax, address feeRecipient)
+    {
+        TokenSpamControl memory s = _getBridgeStorage().spamControl[token];
+        return (s.minCrossOutAmount, s.feeBps, s.feeMin, s.feeMax, s.feeRecipient);
     }
 
     /// @notice Returns the BridgeERC20 beacon address (read helper, not in IBridge interface).

@@ -86,6 +86,21 @@ contract BridgeAgency is Initializable, OwnableUpgradeable {
         IBridge($.bridge).setLocalChainID(chainID);
     }
 
+    /// @notice Configure per-token anti-spam controls (minimum amount + per-tx fee).
+    /// @dev Routes to `Bridge.setSpamControl`. Bridge enforces `feeBps <= MAX_FEE_BPS` (2000) and
+    ///      `feeMin <= feeMax`; setting all fields to zero disables the controls for `token`.
+    function setSpamControl(
+        address token,
+        uint256 minCrossOutAmount,
+        uint16 feeBps,
+        uint256 feeMin,
+        uint256 feeMax,
+        address feeRecipient
+    ) external onlyOwner {
+        AgencyStorage storage $ = _getAgencyStorage();
+        IBridge($.bridge).setSpamControl(token, minCrossOutAmount, feeBps, feeMin, feeMax, feeRecipient);
+    }
+
     // ============= Views =============
 
     /// @notice Returns the Bridge proxy address governed by this agency.
